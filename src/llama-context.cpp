@@ -2969,6 +2969,39 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    // TurboQuant TQ3_K256 pre-scan: this type only handles head_dim=256, and
+    // every non-matching layer silently falls back to Q4_0 in llama_kv_cache.
+    // If NO layer of the whole model matches, the user requested TurboQuant
+    // but is getting pure Q4_0 — warn loudly so the mismatch is visible in
+    // the server startup log. This check sits here (not in the kv_cache
+    // constructor) because ISWA models build TWO caches with disjoint layer
+    // sets; a per-cache check would false-positive on the non-matching cache
+    // even when the other cache DOES get TurboQuant. Running at model-load
+    // time ensures we see the full layer list exactly once.
+    if (params.type_k == GGML_TYPE_TQ3_K256 || params.type_v == GGML_TYPE_TQ3_K256) {
+        uint32_t n_matching = 0;
+        for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
+            const int64_t head_dim_k = model->hparams.n_embd_head_k(il);
+            const int64_t head_dim_v = model->hparams.n_embd_head_v(il);
+            const bool k_match = (params.type_k != GGML_TYPE_TQ3_K256) || (head_dim_k == 256);
+            const bool v_match = (params.type_v != GGML_TYPE_TQ3_K256) || (head_dim_v == 256);
+            if (k_match && v_match) {
+                n_matching++;
+            }
+        }
+        if (n_matching == 0) {
+            LLAMA_LOG_WARN("%s: tq3_k256 requested but no layer of this model has head_dim=256 "
+                    "(checked %u layers); ALL layers will fall back to q4_0 and no TurboQuant "
+                    "compression will be applied. Use --cache-type-k q4_0 directly to silence "
+                    "this warning, or load a model with head_dim=256 (e.g. Gemma 4 E4B).\n",
+                    __func__, model->hparams.n_layer);
+        } else if (n_matching < model->hparams.n_layer) {
+            LLAMA_LOG_INFO("%s: tq3_k256 requested: %u/%u layers match head_dim=256 and will use "
+                    "TurboQuant; remaining layers fall back to q4_0 (heterogeneous attention layout).\n",
+                    __func__, n_matching, model->hparams.n_layer);
+        }
+    }
+
     if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
         params.pooling_type != model->hparams.pooling_type) {
         //user-specified pooling-type is different from the model default

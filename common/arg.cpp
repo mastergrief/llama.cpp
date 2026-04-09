@@ -387,9 +387,14 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_TQ3_K256,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
+    // Short alias: "tq3" -> tq3_k256 (TurboQuant 3-bit, head_dim=256 only)
+    if (s == "tq3") {
+        return GGML_TYPE_TQ3_K256;
+    }
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;
