@@ -5,6 +5,13 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+// Forward decl: defined in ggml/src/ggml-quants.c, whose internal header
+// (ggml-quants.h) is not on this translation unit's include path. The symbol
+// is exported with C linkage via GGML_API extern "C".
+extern "C" {
+    void ggml_tq3_k256_init_impl(void);
+}
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -158,6 +165,42 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    // Per-layer cache type routing for head_dim-specific types like TurboQuant.
+    // Each TurboQuant variant is hardcoded to a specific head_dim (e.g.
+    // GGML_TYPE_TQ3_K256 only handles head_dim=256). When a layer's head_dim
+    // doesn't match, we transparently fall back to a generic quantized type
+    // (Q4_0) so models with heterogeneous attention layouts (Gemma 4 E4B has
+    // mixed head_dim={256, 512}) still load. Layers that DO match the type's
+    // expected head_dim get the high-compression TurboQuant treatment; others
+    // use the fallback. This is the per-layer routing the project's
+    // SESSION_HANDOFF.md identifies as the novel contribution beyond the
+    // existing TheTom/llama-cpp-turboquant Metal port.
+    auto effective_cache_type = [](ggml_type requested, int64_t head_dim) -> ggml_type {
+        switch (requested) {
+            case GGML_TYPE_TQ3_K256:
+                return (head_dim == 256) ? GGML_TYPE_TQ3_K256 : GGML_TYPE_Q4_0;
+            default:
+                return requested;
+        }
+    };
+
+    // Eagerly init TurboQuant tables if any TQ-variant cache type is requested.
+    // The lazy init in the kernels is a safety net but the host should call
+    // explicitly so all worker threads see initialized state on first cache
+    // write. Idempotent.
+    if (type_k == GGML_TYPE_TQ3_K256 || type_v == GGML_TYPE_TQ3_K256) {
+        ggml_tq3_k256_init_impl();
+    }
+
+    // NOTE: the "all layers fall back to q4_0" warning lives in
+    // llama_init_from_model() in llama-context.cpp, NOT here. That's because
+    // ISWA models (e.g. Gemma 4) construct TWO kv caches (one for SWA layers
+    // with head_dim=256, one for non-SWA/FA layers with head_dim=512), and
+    // each constructor call would see only half the layers — causing a false
+    // "no layer of this model has head_dim=256" warning on the FA cache even
+    // though the SWA cache DOES get TurboQuant. The model-load-time check
+    // sees all layers at once and fires at most once.
+
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -194,8 +237,31 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        // Per-layer cache type: head_dim-specific types like GGML_TYPE_TQ3_K256
+        // need to fall back when the layer's head_dim doesn't match.
+        const int64_t head_dim_k = hparams.n_embd_head_k(il);
+        const int64_t head_dim_v = hparams.n_embd_head_v(il);
+        const ggml_type type_k_il = effective_cache_type(type_k, head_dim_k);
+        const ggml_type type_v_il = effective_cache_type(type_v, head_dim_v);
+
+        // For TurboQuant types we log every layer (match OR fallback) so the
+        // user can directly verify which layers actually got the high-
+        // compression treatment. For generic types we only log fallbacks (the
+        // non-TQ case), which currently never fires since non-TQ types never
+        // fall back — but the branch is kept for future head_dim-specific
+        // types added to `effective_cache_type`.
+        const bool is_tq = (type_k == GGML_TYPE_TQ3_K256 || type_v == GGML_TYPE_TQ3_K256);
+        if (is_tq || type_k_il != type_k || type_v_il != type_v) {
+            LLAMA_LOG_INFO("%s: layer %3d: head_dim_k=%lld type_k=%s%s head_dim_v=%lld type_v=%s%s\n",
+                __func__, il,
+                (long long)head_dim_k, ggml_type_name(type_k_il),
+                (type_k_il != type_k) ? " (fallback)" : "",
+                (long long)head_dim_v, ggml_type_name(type_v_il),
+                (type_v_il != type_v) ? " (fallback)" : "");
+        }
+
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k_il, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v_il, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
