@@ -278,6 +278,27 @@ typedef struct {
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
 //
+// TurboQuant rotation-based quantization (KV cache only)
+//
+// One block stores one head_dim=256 vector compressed via TurboQuant:
+//   1. Compute per-vector L2 norm
+//   2. Normalize, then rotate by a fixed orthogonal matrix Pi (256x256, seed=42)
+//   3. Quantize each rotated coordinate to one of 8 Lloyd-Max centroids (3 bits)
+// Indices are packed 8-per-3-bytes (24 bits = 8 * 3-bit indices). 256 elements
+// → 32 groups → 96 bytes for indices + 2 bytes for norm = 98 bytes per block.
+// 3.0625 bits per element. 5.22x compression vs fp16 (512 bytes per vector).
+//
+// The rotation matrix and centroid table are deterministic from the head_dim
+// and seed; both are computed lazily on first use, see ggml-quants.c.
+//
+// 3.0625 bpw
+typedef struct {
+    uint8_t qs[3 * (QK_K / 8)]; // 8 indices per 3 bytes, 32 groups → 96 bytes
+    ggml_half d;                // per-vector L2 norm
+} block_tq3_k256;
+static_assert(sizeof(block_tq3_k256) == sizeof(ggml_half) + 3 * (QK_K / 8), "wrong tq3_k256 block size/padding");
+
+//
 // Super-block quantization structures
 //
 
