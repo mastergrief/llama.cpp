@@ -761,8 +761,11 @@ private:
 
         int n_ctx_slot = llama_n_ctx_seq(ctx);
         if (n_ctx_slot > n_ctx_train) {
-            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
-            n_ctx_slot = n_ctx_train;
+            // PATCHED (claw-code 2026-04-07): allow slot context past trained
+            // limit so users can opt into extrapolation via --ctx-size + RoPE
+            // scaling. Original behavior capped to n_ctx_train silently.
+            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - allowing extrapolation (patched)\n", n_ctx_slot, n_ctx_train);
+            // n_ctx_slot = n_ctx_train;  // <-- patched out
         }
 
         slots.clear();
