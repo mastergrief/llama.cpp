@@ -396,6 +396,16 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
     },
+    [GGML_TYPE_TQ3_K256] = {
+        // TurboQuant 3-bit, 256-element blocks. KV-cache use only.
+        // vec_dot dequantizes the K block on the fly and dots against an F32 Q row,
+        // so vec_dot_type is F32 (Q stays as F32; q_to_vec_dot is the identity copy).
+        // Flash Attention's V read path uses the base ggml.c to_float trait.
+        .from_float               = quantize_row_tq3_k256,
+        .vec_dot                  = ggml_vec_dot_tq3_k256_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },

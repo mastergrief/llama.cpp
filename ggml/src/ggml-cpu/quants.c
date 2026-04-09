@@ -112,6 +112,39 @@ void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, 
     quantize_row_tq2_0_ref(x, y, k);
 }
 
+void quantize_row_tq3_k256(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_K == 0);
+    block_tq3_k256 * GGML_RESTRICT y = vy;
+    quantize_row_tq3_k256_ref(x, y, k);
+}
+
+// Flash Attention dot product: K block (tq3_k256) · Q row (f32) → scalar.
+// Slow reference path: dequantizes one block at a time into a stack buffer.
+// Used for the CPU KV-cache validation path; the GPU path will have a fused kernel.
+void ggml_vec_dot_tq3_k256_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                const void * GGML_RESTRICT vx, size_t bx,
+                                const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    UNUSED(bs); UNUSED(bx); UNUSED(by); UNUSED(nrc);
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+
+    const block_tq3_k256 * GGML_RESTRICT x = vx;
+    const float          * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_K;
+    float buf[QK_K];
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        dequantize_row_tq3_k256(&x[i], buf, QK_K);
+        for (int j = 0; j < QK_K; ++j) {
+            sumf += buf[j] * y[i*QK_K + j];
+        }
+    }
+
+    *s = sumf;
+}
+
 //===================================== Q8_K ==============================================
 
 void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {

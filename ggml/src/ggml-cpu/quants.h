@@ -32,6 +32,13 @@ void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
 
 void quantize_row_tq1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_tq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+void quantize_row_tq3_k256(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+
+// TurboQuant 3-bit dot product against F32 Q (used by Flash Attention K cache reads).
+// Dequantizes the 256-element block on the fly into a stack buffer, then accumulates.
+void ggml_vec_dot_tq3_k256_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                const void * GGML_RESTRICT vx, size_t bx,
+                                const void * GGML_RESTRICT vy, size_t by, int nrc);
 
 void quantize_row_iq4_nl (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
