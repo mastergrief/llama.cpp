@@ -12,6 +12,19 @@
 // kernel for tq3_k256 K cache. Idempotent + thread-safe.
 extern "C" void ggml_fattn_tq3_ensure_init(void);
 
+// Per-TU __constant__ slot holding a device pointer to the tq3_k256 Pi
+// rotation matrix (256 KB, defined in the instance TU). This is the cross-
+// TU indirection mechanism: each TU gets its own private __constant__ slot,
+// only the tq3 instance TU populates it (via cudaGetSymbolAddress + cuda
+// MemcpyToSymbol from inside ggml_fattn_tq3_ensure_init), and only the tq3
+// instance TU reads it (via the kernel template's Pi @ Q precompute branch
+// in fattn-vec.cuh). For other TUs, the slot is allocated but unused
+// because the constexpr-if tq3 branch is dead code there. ~8 bytes per TU
+// is negligible. This avoids the cross-TU __device__ symbol problem nvcc
+// has without RDC, which the original Stage 3 SET_ROWS kernel went out of
+// its way to avoid by using a single TU.
+static __constant__ const float * g_fattn_tq3_pi_const_ptr;
+
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.

@@ -239,6 +239,123 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     }
 
+    // ============================================================
+    // tq3_k256 ALGORITHMIC FAST PATH: Pi @ Q precompute.
+    // ============================================================
+    // For tq3_k256, the dequantize math is:
+    //   Q · K_dequant = Q · (Pi^T @ y_centroids) = (Pi @ Q) · y_centroids
+    // where y_centroids[j] = scale * centroid[code[j]]. By precomputing
+    // PiQ = Pi @ Q ONCE per query (here, before the K row loop), the
+    // per-K-row vec_dot collapses from O(D²) (a full Pi rotation per K
+    // row, ~2k mul-adds per thread per K row) to O(D) (just centroid
+    // lookups + accumulator, ~24 ops per thread per K row). ~85x compute
+    // reduction on the FA hot path; end-to-end token rate improves
+    // accordingly.
+    //
+    // Implementation:
+    //   Step 1: Spill per-thread Q_reg to a shared-mem Q buffer.
+    //   Step 2: All warps cooperate on computing PiQ. Each warp handles
+    //           D/nwarps rows. Within a warp, all 32 lanes cooperate on
+    //           one row via warp_reduce_sum. Lane reads use 32-stride
+    //           chunks for warp-coalesced access into Pi rows.
+    //   Step 3: Each thread reads its 8 PiQ values back into Q_reg. The
+    //           K row loop then uses Q_reg as if it contained PiQ values
+    //           (which it does — vec_dot_fattn_vec_KQ_tq3_k256 expects
+    //           PiQ values in its Q_v parameter, see the instance file).
+    //
+    // This block is dead-code-eliminated for non-tq3_k256 instances via
+    // constexpr-if. The shared-mem buffers and __syncthreads only show
+    // up in the tq3 instance compilation.
+    if constexpr (type_K == GGML_TYPE_TQ3_K256) {
+        static_assert(D == 256,           "tq3_k256 precompute requires D=256");
+        static_assert(nthreads_KQ == 32,  "tq3_k256 precompute requires nthreads_KQ=32");
+        static_assert(D % nwarps == 0,    "D must be divisible by nwarps");
+
+        __shared__ float tq3_Q_shared  [ncols][D];
+        __shared__ float tq3_PiQ_shared[ncols][D];
+
+        const int lane_id = threadIdx.x;
+        const int warp_id = threadIdx.y;
+        constexpr int rows_per_warp = D / nwarps;
+        constexpr int per_thread_q  = D / nthreads_KQ;  // 8 for D=256
+
+        // Step 1: Spill per-thread Q_reg to shared memory. Only warp 0
+        // does the writes (the other warps have identical Q values since
+        // Q load uses threadIdx.x % nthreads_KQ — multiple warps would
+        // write the same data redundantly). All warps see the result via
+        // __syncthreads.
+        if (warp_id == 0) {
+            #pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                #pragma unroll
+                for (int s = 0; s < per_thread_q/2; ++s) {
+#ifdef V_DOT2_F32_F16_AVAILABLE
+                    const half2 q_h2 = Q_reg[j][s];
+                    tq3_Q_shared[j][lane_id*per_thread_q + s*2 + 0] = __low2float (q_h2);
+                    tq3_Q_shared[j][lane_id*per_thread_q + s*2 + 1] = __high2float(q_h2);
+#else
+                    const float2 q_f2 = Q_reg[j][s];
+                    tq3_Q_shared[j][lane_id*per_thread_q + s*2 + 0] = q_f2.x;
+                    tq3_Q_shared[j][lane_id*per_thread_q + s*2 + 1] = q_f2.y;
+#endif
+                }
+            }
+        }
+        __syncthreads();
+
+        // Step 2: Compute PiQ row by row. All warps in parallel, each
+        // handling rows_per_warp rows. Within a warp, 32 lanes cooperate
+        // on one row at a time. Inner loop reads 32 sequential floats
+        // from Pi (warp-coalesced) and 32 sequential floats from
+        // tq3_Q_shared (no bank conflict since stride is 1).
+        #pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            #pragma unroll
+            for (int local_row = 0; local_row < rows_per_warp; ++local_row) {
+                const int     row    = warp_id * rows_per_warp + local_row;
+                const float * pi_row = g_fattn_tq3_pi_const_ptr + (size_t) row * D;
+
+                float partial = 0.0f;
+                #pragma unroll
+                for (int j_chunk = 0; j_chunk < D/WARP_SIZE; ++j_chunk) {
+                    const int k = j_chunk * WARP_SIZE + lane_id;
+                    partial += pi_row[k] * tq3_Q_shared[j][k];
+                }
+
+                // Warp reduce
+                #pragma unroll
+                for (int offset = WARP_SIZE/2; offset > 0; offset /= 2) {
+                    partial += __shfl_xor_sync(0xffffffff, partial, offset);
+                }
+
+                if (lane_id == 0) {
+                    tq3_PiQ_shared[j][row] = partial;
+                }
+            }
+        }
+        __syncthreads();
+
+        // Step 3: Read PiQ from shared mem back into Q_reg. Each thread
+        // overwrites its 8 Q values with the corresponding 8 PiQ values.
+        // All warps do this — they all need their own Q_reg copies updated
+        // since vec_dot_KQ in the K row loop reads from each warp's local
+        // Q_reg.
+        #pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            #pragma unroll
+            for (int s = 0; s < per_thread_q/2; ++s) {
+                const float v0 = tq3_PiQ_shared[j][lane_id*per_thread_q + s*2 + 0];
+                const float v1 = tq3_PiQ_shared[j][lane_id*per_thread_q + s*2 + 1];
+#ifdef V_DOT2_F32_F16_AVAILABLE
+                Q_reg[j][s] = make_half2(__float2half(v0), __float2half(v1));
+#else
+                Q_reg[j][s] = make_float2(v0, v1);
+#endif
+            }
+        }
+        __syncthreads();  // ensure tq3 shared buffers are released before K row loop
+    }
+
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
