@@ -6,6 +6,12 @@
 
 #include <cstdint>
 
+// Lazy host init for the FA tq3_k256 dequant tables. Defined in
+// template-instances/fattn-vec-instance-tq3_k256-tq3_k256.cu and called
+// from ggml_cuda_flash_attn_ext() in fattn.cu before launching the FA
+// kernel for tq3_k256 K cache. Idempotent + thread-safe.
+extern "C" void ggml_fattn_tq3_ensure_init(void);
+
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
@@ -577,6 +583,25 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+// Forward declarations for the tq3_k256 vec_dot and dequantize_V templates.
+// The full definitions live in template-instances/fattn-vec-instance-tq3_k256-tq3_k256.cu
+// (single TU with the device tables for the Pi rotation matrix). Other TUs
+// see only these forward decls and never instantiate the templates because
+// the constexpr-if branch for TQ3_K256 in get_vec_dot_KQ / get_dequantize_V
+// is dead code in non-tq3 instance files.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq3_k256(
+        const char * __restrict__ K_c,
+        const void * __restrict__ Q_v,
+        const int  * __restrict__ Q_q8,
+        const void * __restrict__ Q_ds_v);
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tq3_k256(
+        const void * __restrict__ vx,
+        void       * __restrict__ dst,
+        const int64_t i0);
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -593,6 +618,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TQ3_K256) {
+        return vec_dot_fattn_vec_KQ_tq3_k256<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -615,6 +642,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TQ3_K256) {
+        return dequantize_V_tq3_k256<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

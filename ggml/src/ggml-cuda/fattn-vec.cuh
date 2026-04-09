@@ -85,7 +85,10 @@ static __global__ void flash_attn_ext_vec(
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
-    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
+    // tq3_k256 needs Q in fp32 (the algorithm requires f32 dot products
+    // after Pi rotation — there is no q8_1 quantized Q path). Take the
+    // f16/bf16 register branch instead of the quantized-Q branch.
+    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16 && type_K != GGML_TYPE_TQ3_K256;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
 #else
@@ -598,3 +601,8 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
+
+// tq3_k256 only supports D=256 K=tq3_k256 V=tq3_k256 (single combination,
+// not the full V cross-product). Declare the one instance directly so the
+// fattn dispatcher in fattn.cu can resolve the symbol at link time.
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TQ3_K256, GGML_TYPE_TQ3_K256);

@@ -284,6 +284,12 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
+    // tq3_k256 is D=256-only (Pi rotation matrix is tied to head_dim=256).
+    // Skip the FATTN_VEC_CASES_ALL_D wrapper to avoid instantiating
+    // D=64/128 templates which would trigger the static_assert(D==256)
+    // in vec_dot_fattn_vec_KQ_tq3_k256.
+    FATTN_VEC_CASE(256, GGML_TYPE_TQ3_K256, GGML_TYPE_TQ3_K256)
+
     GGML_ABORT("fatal error");
 }
 
@@ -383,9 +389,27 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_TQ3_K256:
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // tq3_k256 requires the VEC kernel: there is no MMA/WMMA/TILE path
+    // for it, and the algorithm needs f32 dot products after Pi rotation
+    // (no q8_1 quantized Q). Force VEC and bail if the vector kernel
+    // can't handle this shape. Mask handling matches the generic check
+    // below: present + ne[2] != 1 is unsupported, but null mask is fine.
+    if (K->type == GGML_TYPE_TQ3_K256 || V->type == GGML_TYPE_TQ3_K256) {
+        const bool can_use_vector_kernel_tq3 =
+            Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+        if (!can_use_vector_kernel_tq3) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        if (mask && mask->ne[2] != 1) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        return BEST_FATTN_KERNEL_VEC;
     }
 
     if (mask && mask->ne[2] != 1) {
@@ -499,6 +523,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    // Lazy-init the FA tq3_k256 dequant tables on first dispatch with a
+    // tq3 K or V cache. The init function is std::call_once-guarded, so
+    // repeated calls are cheap (one flag check after the first call).
+    const ggml_tensor * K_in = dst->src[1];
+    const ggml_tensor * V_in = dst->src[2];
+    if ((K_in && K_in->type == GGML_TYPE_TQ3_K256) ||
+        (V_in && V_in->type == GGML_TYPE_TQ3_K256)) {
+        ggml_fattn_tq3_ensure_init();
+    }
+
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
