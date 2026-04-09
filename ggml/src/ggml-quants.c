@@ -2407,6 +2407,230 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+// ====================== TurboQuant 3-bit, head_dim=256 (KV cache only) =====
+//
+// One block stores one head_dim=256 vector compressed via TurboQuant:
+//   1. Compute per-vector L2 norm
+//   2. Normalize, then rotate by a fixed orthogonal matrix Pi (256x256, seed=42)
+//   3. Quantize each rotated coordinate to one of 8 Lloyd-Max centroids (3 bits)
+//
+// Pi is precomputed in Python (scripts/generate_turboquant_tables.py) and
+// embedded as a static const float[256*256] array via turboquant_tables.h.
+// The centroid table is computed at runtime in pure C using the closed-form
+// Gaussian E[x|a<x<b] (no scipy needed). The reference Python codebook is
+// also embedded in the header for unit-test comparison.
+//
+// IMPORTANT: ggml_tq3_k256_init_impl() must be called once before any thread
+// touches a TQ3_K256 cache tensor. The host (llama.cpp) calls it at model
+// load time. Lazy init in the kernels themselves is a fallback safety net.
+
+#include "turboquant_tables.h"
+
+static int   tq3_k256_initialized = 0;
+static float tq3_k256_centroids [TQ3_K256_N_LEVELS];
+static float tq3_k256_boundaries[TQ3_K256_N_LEVELS - 1];
+
+// Closed-form Lloyd-Max for N(0, sigma^2) with sigma = 1/sqrt(d).
+// Replaces scipy.integrate.quad in the Python reference using:
+//   ∫(a,b) x * N(x; 0, σ²) dx = -σ² * (N(b) - N(a))
+//   ∫(a,b)     N(x; 0, σ²) dx = 0.5 * (erf(b/(σ√2)) - erf(a/(σ√2)))
+static void ggml_tq3_k256_compute_codebook_impl(void) {
+    const int   n_levels = TQ3_K256_N_LEVELS;
+    const float d        = (float) TQ3_K256_HEAD_DIM;
+    const float sigma    = 1.0f / sqrtf(d);
+    const float lo       = -3.5f * sigma;
+    const float hi       =  3.5f * sigma;
+
+    float c[TQ3_K256_N_LEVELS];
+    float b[TQ3_K256_N_LEVELS - 1];
+
+    // initial uniform spacing across [lo, hi)
+    for (int i = 0; i < n_levels; i++) {
+        c[i] = lo + (hi - lo) * ((float)i + 0.5f) / (float)n_levels;
+    }
+
+    const float inv_sigma_sqrt2 = 1.0f / (sigma * sqrtf(2.0f));
+    const float pdf_norm        = 1.0f / (sigma * sqrtf(2.0f * (float) M_PI));
+    const float sigma_sq        = sigma * sigma;
+
+    for (int iter = 0; iter < 200; iter++) {
+        // boundaries = midpoints between adjacent centroids
+        for (int i = 0; i < n_levels - 1; i++) {
+            b[i] = 0.5f * (c[i] + c[i+1]);
+        }
+
+        // edges: outermost intervals extend to ±(3 * lo) to match the Python
+        // reference (which uses ±(3 * lo / hi) sentinels for the unbounded tails)
+        float edges[TQ3_K256_N_LEVELS + 1];
+        edges[0]        = lo * 3.0f;
+        edges[n_levels] = hi * 3.0f;
+        for (int i = 0; i < n_levels - 1; i++) {
+            edges[i + 1] = b[i];
+        }
+
+        float new_c[TQ3_K256_N_LEVELS];
+        float max_diff = 0.0f;
+
+        for (int i = 0; i < n_levels; i++) {
+            const float a  = edges[i];
+            const float bb = edges[i + 1];
+
+            const float pdf_a = pdf_norm * expf(-0.5f * (a  * a)  / sigma_sq);
+            const float pdf_b = pdf_norm * expf(-0.5f * (bb * bb) / sigma_sq);
+
+            const float num = -sigma_sq * (pdf_b - pdf_a);
+            const float den = 0.5f * (erff(bb * inv_sigma_sqrt2) - erff(a * inv_sigma_sqrt2));
+
+            new_c[i] = (den > 1e-15f) ? (num / den) : c[i];
+
+            const float diff = fabsf(new_c[i] - c[i]);
+            if (diff > max_diff) max_diff = diff;
+        }
+
+        memcpy(c, new_c, sizeof(c));
+        if (max_diff < 1e-10f) break;
+    }
+
+    // final boundaries
+    for (int i = 0; i < n_levels - 1; i++) {
+        b[i] = 0.5f * (c[i] + c[i+1]);
+    }
+
+    memcpy(tq3_k256_centroids,  c, sizeof(c));
+    memcpy(tq3_k256_boundaries, b, sizeof(b));
+}
+
+void ggml_tq3_k256_init_impl(void) {
+    if (tq3_k256_initialized) {
+        return;
+    }
+    ggml_tq3_k256_compute_codebook_impl();
+    tq3_k256_initialized = 1;
+}
+
+// Test/inspection helpers — exposed via ggml-quants.h so the unit test can
+// verify the runtime codebook matches the PyTorch reference.
+const float * ggml_tq3_k256_get_centroids(void) {
+    if (!tq3_k256_initialized) ggml_tq3_k256_init_impl();
+    return tq3_k256_centroids;
+}
+
+const float * ggml_tq3_k256_get_boundaries(void) {
+    if (!tq3_k256_initialized) ggml_tq3_k256_init_impl();
+    return tq3_k256_boundaries;
+}
+
+const float * ggml_tq3_k256_get_pi(void) {
+    return TQ3_K256_PI;
+}
+
+void quantize_row_tq3_k256_ref(const float * GGML_RESTRICT x, block_tq3_k256 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    assert(QK_K == TQ3_K256_HEAD_DIM); // block size must equal head_dim for one-vector-per-block
+
+    if (!tq3_k256_initialized) {
+        ggml_tq3_k256_init_impl();
+    }
+
+    const int64_t nb = k / QK_K;
+    const float * boundaries = tq3_k256_boundaries;
+
+    for (int64_t i = 0; i < nb; i++) {
+        // 1. L2 norm of the input vector
+        float norm_sq = 0.0f;
+        for (int j = 0; j < TQ3_K256_HEAD_DIM; j++) {
+            norm_sq += x[j] * x[j];
+        }
+        const float norm     = sqrtf(norm_sq);
+        const float inv_norm = (norm > 1e-8f) ? (1.0f / norm) : 0.0f;
+
+        // 2. rotated[ii] = inv_norm * <x, Pi[ii, :]>   (i.e. Pi^T applied to x_normed)
+        // Pi is row-major, so row ii starts at TQ3_K256_PI + ii * TQ3_K256_HEAD_DIM.
+        float rotated[TQ3_K256_HEAD_DIM];
+        for (int ii = 0; ii < TQ3_K256_HEAD_DIM; ii++) {
+            const float * GGML_RESTRICT row = TQ3_K256_PI + (size_t)ii * TQ3_K256_HEAD_DIM;
+            float acc = 0.0f;
+            for (int j = 0; j < TQ3_K256_HEAD_DIM; j++) {
+                acc += x[j] * row[j];
+            }
+            rotated[ii] = inv_norm * acc;
+        }
+
+        // 3. quantize each rotated coordinate via boundaries (8 centroids → 3 bits each).
+        // Pack 8 × 3-bit indices into 3 bytes (24 bits) per group, 32 groups per block.
+        for (int g = 0; g < TQ3_K256_HEAD_DIM / 8; g++) {
+            uint32_t packed = 0;
+            for (int s = 0; s < 8; s++) {
+                const float v = rotated[g * 8 + s];
+                int idx;
+                // monotonic 7-boundary linear scan; faster than binary search at this size
+                if      (v < boundaries[0]) idx = 0;
+                else if (v < boundaries[1]) idx = 1;
+                else if (v < boundaries[2]) idx = 2;
+                else if (v < boundaries[3]) idx = 3;
+                else if (v < boundaries[4]) idx = 4;
+                else if (v < boundaries[5]) idx = 5;
+                else if (v < boundaries[6]) idx = 6;
+                else                        idx = 7;
+                packed |= ((uint32_t) idx) << (s * 3);
+            }
+            y[i].qs[g * 3 + 0] = (uint8_t) ( packed        & 0xFF);
+            y[i].qs[g * 3 + 1] = (uint8_t) ((packed >>  8) & 0xFF);
+            y[i].qs[g * 3 + 2] = (uint8_t) ((packed >> 16) & 0xFF);
+        }
+
+        y[i].d = GGML_FP32_TO_FP16(norm);
+        x += TQ3_K256_HEAD_DIM;
+    }
+}
+
+size_t quantize_tq3_k256(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void) quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_TQ3_K256, n_per_row);
+    quantize_row_tq3_k256_ref(src, dst, (int64_t) nrow * n_per_row);
+    return nrow * row_size;
+}
+
+void dequantize_row_tq3_k256(const block_tq3_k256 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    assert(QK_K == TQ3_K256_HEAD_DIM);
+
+    if (!tq3_k256_initialized) {
+        ggml_tq3_k256_init_impl();
+    }
+
+    const int64_t nb = k / QK_K;
+    const float * centroids = tq3_k256_centroids;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float norm = GGML_FP16_TO_FP32(x[i].d);
+
+        // 1. unpack 8 × 3-bit indices per 3-byte group, look up centroids
+        float y_hat[TQ3_K256_HEAD_DIM];
+        for (int g = 0; g < TQ3_K256_HEAD_DIM / 8; g++) {
+            const uint32_t packed =
+                  (uint32_t) x[i].qs[g * 3 + 0]
+                | ((uint32_t) x[i].qs[g * 3 + 1] <<  8)
+                | ((uint32_t) x[i].qs[g * 3 + 2] << 16);
+            for (int s = 0; s < 8; s++) {
+                const int idx = (int)((packed >> (s * 3)) & 7u);
+                y_hat[g * 8 + s] = centroids[idx];
+            }
+        }
+
+        // 2. result[ii] = norm * <y_hat, Pi[:, ii]>   (i.e. Pi applied to y_hat)
+        // Column-strided read of Pi — fine for the reference path; CUDA will tile.
+        for (int ii = 0; ii < TQ3_K256_HEAD_DIM; ii++) {
+            float acc = 0.0f;
+            for (int j = 0; j < TQ3_K256_HEAD_DIM; j++) {
+                acc += y_hat[j] * TQ3_K256_PI[(size_t)j * TQ3_K256_HEAD_DIM + ii];
+            }
+            y[ii] = acc * norm;
+        }
+        y += TQ3_K256_HEAD_DIM;
+    }
+}
+
 // ====================== "True" 2-bit (de)-quantization
 
 void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
