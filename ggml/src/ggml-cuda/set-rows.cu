@@ -1,5 +1,9 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
+#include "turboquant.cuh"
+
+// QK_K is defined in ggml-common.h via the includes above; tq3_k256 uses it
+// as its block size (256 elements per block, one head_dim=256 vector).
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -309,6 +313,33 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
+    } else if (dst->type == GGML_TYPE_TQ3_K256) {
+        // TurboQuant 3-bit, 256-element blocks. Lazy device-table init on
+        // first dispatch (Pi rotation matrix + Lloyd-Max codebook → device).
+        // The launch wrapper lives in turboquant.cu (everything tq3-related
+        // stays in one TU to avoid cross-TU __device__ symbol issues).
+        ggml_tq3_k256_ensure_cuda_init();
+        if constexpr (std::is_same_v<idx_t, int64_t>) {
+            ggml_cuda_set_rows_tq3_k256_i64(
+                src0_d, (const int64_t *) src1_d, dst->data,
+                ne00, ne01, ne02, ne03,
+                ne10, ne11, ne12, ne13,
+                nb01, nb02, nb03,
+                nb10, nb11, nb12,
+                nb1, nb2, nb3,
+                stream
+            );
+        } else {
+            ggml_cuda_set_rows_tq3_k256_i32(
+                src0_d, (const int32_t *) src1_d, dst->data,
+                ne00, ne01, ne02, ne03,
+                ne10, ne11, ne12, ne13,
+                nb01, nb02, nb03,
+                nb10, nb11, nb12,
+                nb1, nb2, nb3,
+                stream
+            );
+        }
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }
