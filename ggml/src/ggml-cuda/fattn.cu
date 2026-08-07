@@ -583,15 +583,21 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
-    // PlanarQuant/IsoQuant: force VEC kernel (only implementation we have).
-    // Check BOTH K and V — asymmetric configs like q8_0 K + iso3 V also need VEC.
-    auto is_planar_iso = [](ggml_type t) {
-        return t == GGML_TYPE_PLANAR3_0 || t == GGML_TYPE_ISO3_0 ||
-               t == GGML_TYPE_PLANAR4_0 || t == GGML_TYPE_ISO4_0;
-    };
-    if (is_planar_iso(K->type) || is_planar_iso(V->type)) {
-        return BEST_FATTN_KERNEL_VEC;
-    }
+    // PlanarQuant/IsoQuant used to force BEST_FATTN_KERNEL_VEC unconditionally,
+    // because VEC is the only kernel that reads quantized KV natively and
+    // convert.cu had no to_fp16 entry for these types. That pinned prefill onto
+    // the batch-1 decode kernel on every GPU, tensor cores or not.
+    //
+    // convert.cu now dispatches planar3/iso3/planar4/iso4 in both
+    // ggml_get_to_fp16_cuda and ggml_get_to_fp16_nc_cuda, so the TILE/MMA paths
+    // can materialize f16 K/V like they already do for turbo2/turbo3. The
+    // generic logic below then routes small batches to VEC (native quantized
+    // read, no f16 scratch) and large batches to TILE/MMA — is_quantized is
+    // true for all four types, so it takes the quantized branches.
+    //
+    // Cost of the large-batch path: a full f16 copy of K and V per layer via
+    // ggml_cuda_flash_attn_ext_get_f16_extra_data. On a small-VRAM card that
+    // scratch can outweigh the prefill speedup; measure before assuming a win.
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {

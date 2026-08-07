@@ -18,6 +18,14 @@
 #define QR_TURBO2 1  // Each dequantize call produces 2 consecutive elements (like q8_0)
 #define QR_TURBO4 1  // Each dequantize call produces 2 consecutive elements (like q8_0)
 
+// PlanarQuant/IsoQuant emit 2 consecutive elements per call as well: planar's
+// inverse Givens rotates a pair directly, and iso's inverse quaternion unpacks
+// its full 4-element group internally and returns the half selected by iqs%4.
+#define QR_PLANAR3 1
+#define QR_ISO3    1
+#define QR_PLANAR4 1
+#define QR_ISO4    1
+
 // ---- 2-bit centroids (Lloyd-Max for N(0, 1/128)) ----
 
 static __constant__ float TURBO_CENTROIDS_2BIT[4] = {
